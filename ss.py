@@ -1,4 +1,30 @@
 
+# --- Optional runtime bootstrap (fallback only) ---
+# Tries to install openpyxl at runtime if it's missing.
+# Not recommended for Streamlit Cloud, but handy for local runs without requirements setup.
+
+def _ensure_openpyxl():
+    try:
+        import openpyxl  # noqa: F401
+        return
+    except Exception:
+        pass
+
+    import sys, subprocess
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-cache-dir", "openpyxl>=3.1"])
+        import openpyxl  # noqa: F401
+    except Exception as e:
+        import streamlit as st
+        st.error(
+            "Failed to install **openpyxl** at runtime. "
+            "Please ensure `requirements.txt` includes `openpyxl>=3.1` and redeploy."
+        )
+        st.stop()
+
+_ensure_openpyxl()
+# --- End fallback ---
+
 # app.py
 # -*- coding: utf-8 -*-
 """
@@ -275,3 +301,4 @@ if uploaded is not None:
         st.code(tb)
 else:
     st.info("Upload an Excel")
+
