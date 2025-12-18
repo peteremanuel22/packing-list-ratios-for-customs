@@ -26,6 +26,7 @@ _ensure_openpyxl()
 # --- End fallback ---
 
 
+
 # app.py
 # -*- coding: utf-8 -*-
 """
@@ -35,6 +36,7 @@ Packing List Recalculator (Gas Cookers)
 - Keep structure & style; only update 'Qu.' using per-cooker ratios.
 - Handles merged cells safely (writes to master cell only).
 - Only updates rows whose original 'Qu.' is numeric; leaves text/non-numeric as-is.
+- Preview shows ARABIC component name.
 - Robust error handling to avoid white screen.
 """
 
@@ -157,14 +159,14 @@ def component_id_from_row(ws: Worksheet, row: int, col_map: Dict[str, int]) -> s
     comp_name = comp_e if comp_e else comp_ar
     return f"{code}|{comp_name}"
 
-# Occurrence tuple type:
-# (ws_name, row_idx, q_col, numeric_q, is_numeric)
-Occurrence = Tuple[str, int, int, int, bool]
+# Occurrence tuple type now includes ARABIC NAME:
+# (ws_name, row_idx, q_col, numeric_q, is_numeric, arabic_name)
+Occurrence = Tuple[str, int, int, int, bool, str]
 
 def extract_component_occurrences(wb) -> Dict[str, List[Occurrence]]:
     """
     Returns: component_id -> list of occurrences
-    Each occurrence: (worksheet_name, row_idx, q_col, numeric_q, is_numeric)
+    Each occurrence: (worksheet_name, row_idx, q_col, numeric_q, is_numeric, arabic_name)
     """
     comp_occ: Dict[str, List[Occurrence]] = {}
     for ws in wb.worksheets:
@@ -180,8 +182,9 @@ def extract_component_occurrences(wb) -> Dict[str, List[Occurrence]]:
                     continue
                 q_raw = ws.cell(row=r, column=q_col).value
                 is_num, q_val = parse_quantity(q_raw)
+                arabic_name = norm(ws.cell(row=r, column=cmap.get("component in arabic", 0)).value)
                 cid = component_id_from_row(ws, r, cmap)
-                comp_occ.setdefault(cid, []).append((ws.title, r, q_col, q_val, is_num))
+                comp_occ.setdefault(cid, []).append((ws.title, r, q_col, q_val, is_num, arabic_name))
     return comp_occ
 
 def largest_remainder_allocate(originals: List[int], target_total: int) -> List[int]:
@@ -218,13 +221,13 @@ def safe_write(ws: Worksheet, row: int, col: int, value: int) -> None:
     """
     cell = ws.cell(row=row, column=col)
     # If the cell is a merged child, find its merged range and write to the top-left cell
-    if isinstance(cell, MergedCell) or cell.coordinate in ws.merged_cells:
+    if isinstance(cell, MergedCell):
         for rng in ws.merged_cells.ranges:
             if cell.coordinate in rng:
                 master = ws.cell(row=rng.min_row, column=rng.min_col)
                 master.value = int(value)
                 return
-    # Normal cell
+    # Normal cell (or possibly the master of a merged range)
     cell.value = int(value)
 
 def apply_allocations(wb, comp_occ: Dict[str, List[Occurrence]], comp_targets: Dict[str, int]) -> None:
@@ -240,15 +243,15 @@ def apply_allocations(wb, comp_occ: Dict[str, List[Occurrence]], comp_targets: D
             continue
 
         # Split occurrences into numeric vs non-numeric
-        numeric_occs = [(ws, r, c, q, is_num) for (ws, r, c, q, is_num) in occs if is_num]
+        numeric_occs = [(ws, r, c, q, is_num, ar) for (ws, r, c, q, is_num, ar) in occs if is_num]
         if not numeric_occs:
             # Nothing to write for this component
             continue
 
-        originals = [q for (_, _, _, q, _) in numeric_occs]
+        originals = [q for (_, _, _, q, _, _) in numeric_occs]
         new_vals = largest_remainder_allocate(originals, target_total)
 
-        for new_q, (ws_name, row_idx, q_col, _, _) in zip(new_vals, numeric_occs):
+        for new_q, (ws_name, row_idx, q_col, _, _, _) in zip(new_vals, numeric_occs):
             ws = ws_index[ws_name]
             safe_write(ws, row_idx, q_col, int(new_q))
 
@@ -258,7 +261,7 @@ def compute_ratios(comp_occ: Dict[str, List[Occurrence]], original_cookers: int)
         return {k: 0.0 for k in comp_occ}
     ratios = {}
     for cid, occs in comp_occ.items():
-        total_q_numeric = sum(q for (_, _, _, q, is_num) in occs if is_num)
+        total_q_numeric = sum(q for (_, _, _, q, is_num, _) in occs if is_num)
         ratios[cid] = total_q_numeric / float(original_cookers)
     return ratios
 
@@ -277,19 +280,24 @@ def split_cid(cid: str) -> Tuple[str, str]:
     return code, name
 
 def build_preview_dataframe(comp_occ: Dict[str, List[Occurrence]], ratios: Dict[str, float], targets: Dict[str, int]):
+    """
+    Build the preview DataFrame.
+    Shows Arabic component name (from the first occurrence of each component_id).
+    """
     rows = []
     for cid, occs in comp_occ.items():
-        code, name = split_cid(cid)
-        original_total_numeric = sum(q for (_, _, _, q, is_num) in occs if is_num)
+        code, _ = split_cid(cid)
+        arabic_name = occs[0][5] if occs else ""
+        original_total_numeric = sum(q for (_, _, _, q, is_num, _) in occs if is_num)
         rows.append({
             "Code": code,
-            "Component": name,
+            "Component (Arabic)": arabic_name,
             "Original total (numeric Qu.)": original_total_numeric,
             "Per-cooker ratio": ratios.get(cid, 0.0),
             "Target total (Qu.)": targets.get(cid, original_total_numeric),
             "Occurrences (numeric/all)": f"{sum(1 for o in occs if o[4])}/{len(occs)}"
         })
-    df = pd.DataFrame(rows).sort_values(["Code", "Component"]).reset_index(drop=True)
+    df = pd.DataFrame(rows).sort_values(["Code", "Component (Arabic)"]).reset_index(drop=True)
     return df
 
 def is_packaging_component(cid: str) -> bool:
@@ -327,7 +335,7 @@ if uploaded is not None:
                 for cid in list(comp_occ.keys()):
                     if is_packaging_component(cid):
                         # Keep original numeric total for packaging items
-                        orig_total_numeric = sum(q for (_, _, _, q, is_num) in comp_occ[cid] if is_num)
+                        orig_total_numeric = sum(q for (_, _, _, q, is_num, _) in comp_occ[cid] if is_num)
                         targets[cid] = orig_total_numeric
 
             # Preview
@@ -349,7 +357,7 @@ if uploaded is not None:
         st.download_button(
             label="Download recalculated packing list (.xlsx)",
             data=out_buf,
-            file_name="packing_list_recalculated.xlsx",
+            file_name            file_name="packing_list_recalculated.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
@@ -359,6 +367,7 @@ if uploaded is not None:
         tb = traceback.format_exc()
         st.text("Traceback:")
         st.code(tb)
+else:
 
 # ==== Centered footer ====
 footer_css = """
@@ -383,3 +392,4 @@ footer_html = """
 """
 st.markdown(footer_css, unsafe_allow_html=True)
 st.markdown(footer_html, unsafe_allow_html=True)
+
