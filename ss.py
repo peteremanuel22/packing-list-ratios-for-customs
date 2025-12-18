@@ -367,7 +367,6 @@ if uploaded is not None:
         tb = traceback.format_exc()
         st.text("Traceback:")
         st.code(tb)
-else:
 
 # ==== Centered footer ====
 footer_css = """
@@ -392,3 +391,4 @@ footer_html = """
 """
 st.markdown(footer_css, unsafe_allow_html=True)
 st.markdown(footer_html, unsafe_allow_html=True)
+
