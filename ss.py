@@ -27,6 +27,7 @@ _ensure_openpyxl()
 
 
 
+
 # app.py
 # -*- coding: utf-8 -*-
 """
@@ -37,7 +38,7 @@ Packing List Recalculator (Gas Cookers)
 - Handles merged cells safely (writes to master cell only).
 - Only updates rows whose original 'Qu.' is numeric; leaves text/non-numeric as-is.
 - Preview shows ARABIC component name.
-- Robust error handling to avoid white screen.
+- Robust error handling to avoid blank screen.
 """
 
 import io
@@ -242,10 +243,9 @@ def apply_allocations(wb, comp_occ: Dict[str, List[Occurrence]], comp_targets: D
         if target_total is None:
             continue
 
-        # Split occurrences into numeric vs non-numeric
+        # Numeric-only occurrences
         numeric_occs = [(ws, r, c, q, is_num, ar) for (ws, r, c, q, is_num, ar) in occs if is_num]
         if not numeric_occs:
-            # Nothing to write for this component
             continue
 
         originals = [q for (_, _, _, q, _, _) in numeric_occs]
@@ -343,7 +343,7 @@ if uploaded is not None:
             df_prev = build_preview_dataframe(comp_occ, ratios, targets)
             st.dataframe(df_prev, use_container_width=True)
 
-            # Rewrite quantities while preserving styles
+                       # Rewrite quantities while preserving styles
             bio_in.seek(0)
             wb_out = load_workbook(filename=io.BytesIO(bio_in.read()), data_only=False)
             apply_allocations(wb_out, comp_occ, targets)
@@ -357,7 +357,7 @@ if uploaded is not None:
         st.download_button(
             label="Download recalculated packing list (.xlsx)",
             data=out_buf,
-            file_name            file_name="packing_list_recalculated.xlsx",
+            file_name="packing_list_recalculated.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
@@ -367,7 +367,8 @@ if uploaded is not None:
         tb = traceback.format_exc()
         st.text("Traceback:")
         st.code(tb)
-        
+else:
+
 # ==== Centered footer ====
 footer_css = """
 <style>
@@ -391,5 +392,6 @@ footer_html = """
 """
 st.markdown(footer_css, unsafe_allow_html=True)
 st.markdown(footer_html, unsafe_allow_html=True)
+
 
 
