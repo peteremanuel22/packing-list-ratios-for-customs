@@ -33,28 +33,29 @@ _ensure_openpyxl()
 """
 Packing List Recalculator (Gas Cookers)
 - Multi-sheet Excel input (each sheet = a container).
-- Detect multiple tables by header row (S.N, Box code, component in arabic, component in E, Codes, Qu., Box).
-- Keep structure & style; only update 'Qu.' using per-cooker ratios.
-- Handles merged cells safely (writes to master cell only).
-- Only updates rows whose original 'Qu.' is numeric; leaves text/non-numeric as-is.
-- Preview shows ARABIC component name.
-- Robust error handling to avoid blank screen.
+- Detect multiple tables by header row:
+  S.N | Box code | component in arabic | component in E | Codes | Qu. | Box
+- Preserve structure & styles; only update 'Qu.' using per-cooker ratios.
+- Safe READ and WRITE for merged cells (read/write the master—top-left—cell).
+- Only updates rows whose original 'Qu.' is numeric; text/unit rows remain as-is.
+- Preview shows the ARABIC component name.
+- GROUPING BY CODE ONLY. If Codes is empty, treat the row as unique (no cross-row merging).
+- Robust error handling (no blank page; errors are shown in the UI).
 """
 
 import io
 import re
 import traceback
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple, Any, Optional
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 from openpyxl import load_workbook
 from openpyxl.worksheet.worksheet import Worksheet
-from openpyxl.cell.cell import MergedCell
 
 # -------------------------
-# UI setup (render immediately)
+# UI setup
 # -------------------------
 st.set_page_config(page_title="Packing List Recalculator", layout="wide")
 st.title("Packing List Recalculator (Gas Cookers)")
@@ -69,37 +70,33 @@ EXPECTED_HEADERS = {
     "S.N", "Box code", "component in arabic", "component in E", "Codes", "Qu.", "Box"
 }
 
-# Optional: detect packaging items by keywords (used only if you check the box)
 PACKAGING_PATTERNS = [
     r"foam", r"فوم", r"carton", r"كرتون", r"كرتونة", r"زاوية فوم", r"قاعدة فوم", r"شريحة فوم"
 ]
 packaging_re = re.compile("|".join(PACKAGING_PATTERNS), flags=re.IGNORECASE)
 
 def norm(x: Any) -> str:
-    """Normalize cell value to trimmed string."""
+    """Normalize a cell value to trimmed string."""
     if x is None:
         return ""
     return str(x).strip()
 
 def parse_quantity(q_raw: Any) -> Tuple[bool, int]:
     """
-    Try to extract a numeric quantity from a cell value.
+    Extract a numeric quantity from a cell value.
     Returns (is_numeric, int_value).
-
-    - Accepts numbers stored as text or float (e.g., '120', '120.0').
-    - If the text contains a number with words (e.g., '4 بالته'), extracts the first number.
+    - Accepts numbers stored as text/float ('120', '120.0').
+    - If text contains a number with words ('4 بالته'), extracts the first number.
     - If nothing numeric is found, returns (False, 0).
     """
     s = norm(q_raw)
     if s == "":
         return (False, 0)
-    # Direct numeric
     try:
         val = float(s)
         return (True, int(round(val)))
     except Exception:
         pass
-    # Try to find first number inside text
     m = re.search(r"[-+]?\d+(?:\.\d+)?", s)
     if m:
         try:
@@ -110,14 +107,48 @@ def parse_quantity(q_raw: Any) -> Tuple[bool, int]:
     return (False, 0)
 
 def is_header_row(values: List[Any]) -> bool:
-    """Header row if essential subset appears."""
+    """Treat a row as header if essential subset appears."""
     vals = {norm(v) for v in values if norm(v)}
     essential = {"S.N", "Codes", "Qu."}
     return essential.issubset(vals)
 
+# -------------------------
+# merged-cell helpers
+# -------------------------
+def find_merged_master(ws: Worksheet, row: int, col: int) -> Optional[Tuple[int, int]]:
+    """
+    If (row, col) is inside a merged range, return (min_row, min_col) of that range.
+    Otherwise return None.
+    """
+    coord = ws.cell(row=row, column=col).coordinate
+    for rng in ws.merged_cells.ranges:
+        if coord in rng:
+            return (rng.min_row, rng.min_col)
+    return None
+
+def safe_read(ws: Worksheet, row: int, col: int) -> Any:
+    """
+    Read value from cell (row, col); if it's part of a merged range, return the master (top-left) value.
+    """
+    master = find_merged_master(ws, row, col)
+    if master is not None:
+        return ws.cell(row=master[0], column=master[1]).value
+    return ws.cell(row=row, column=col).value
+
+def safe_write(ws: Worksheet, row: int, col: int, value: int) -> None:
+    """
+    Write to cell (row, col); if it's a merged child cell, redirect to the master (top-left) cell.
+    """
+    master = find_merged_master(ws, row, col)
+    target_row, target_col = (master if master is not None else (row, col))
+    ws.cell(row=target_row, column=target_col).value = int(value)
+
+# -------------------------
+# table detection
+# -------------------------
 def find_tables(ws: Worksheet) -> List[Dict[str, Any]]:
     """
-    Scan worksheet to find tables by header rows.
+    Scan a worksheet to find tables by header rows.
     Return list of dicts: {header_row, col_map, data_rows}
     """
     tables = []
@@ -126,25 +157,21 @@ def find_tables(ws: Worksheet) -> List[Dict[str, Any]]:
 
     row_idx = 1
     while row_idx <= max_row:
-        row_vals = [ws.cell(row=row_idx, column=c).value for c in range(1, max_col + 1)]
+        row_vals = [safe_read(ws, row_idx, c) for c in range(1, max_col + 1)]
         if is_header_row(row_vals):
-            # Build column map (header -> col index)
             col_map = {}
             for c in range(1, max_col + 1):
-                h = norm(ws.cell(row=row_idx, column=c).value)
+                h = norm(safe_read(ws, row_idx, c))
                 if h in EXPECTED_HEADERS:
                     col_map[h] = c
-
-            # Collect data rows until next header or end
             data_rows = []
             r = row_idx + 1
             while r <= max_row:
-                candidate = [ws.cell(row=r, column=c).value for c in range(1, max_col + 1)]
+                candidate = [safe_read(ws, r, c) for c in range(1, max_col + 1)]
                 if is_header_row(candidate):
                     break
                 data_rows.append(r)
                 r += 1
-
             tables.append({"header_row": row_idx, "col_map": col_map, "data_rows": data_rows})
             row_idx = r
         else:
@@ -152,15 +179,21 @@ def find_tables(ws: Worksheet) -> List[Dict[str, Any]]:
 
     return tables
 
+# -------------------------
+# component & occurrences
+# -------------------------
 def component_id_from_row(ws: Worksheet, row: int, col_map: Dict[str, int]) -> str:
-    """Prefer Codes; otherwise use English/Arabic names to keep 'بدون' items distinct."""
-    code = norm(ws.cell(row=row, column=col_map.get("Codes", 0)).value)
-    comp_e = norm(ws.cell(row=row, column=col_map.get("component in E", 0)).value)
-    comp_ar = norm(ws.cell(row=row, column=col_map.get("component in arabic", 0)).value)
-    comp_name = comp_e if comp_e else comp_ar
-    return f"{code}|{comp_name}"
+    """
+    Build component identifier: GROUP BY CODE ONLY.
+    - If Codes is present: use it as the unique key.
+    - If Codes is empty: create a per-row unique key so we don't merge unrelated "بدون" lines.
+    """
+    code = norm(safe_read(ws, row, col_map.get("Codes", 0)))
+    if code:
+        return code
+    return f"__NO_CODE__@{ws.title}@{row}"
 
-# Occurrence tuple type now includes ARABIC NAME:
+# Occurrence tuple includes ARABIC NAME:
 # (ws_name, row_idx, q_col, numeric_q, is_numeric, arabic_name)
 Occurrence = Tuple[str, int, int, int, bool, str]
 
@@ -178,24 +211,28 @@ def extract_component_occurrences(wb) -> Dict[str, List[Occurrence]]:
             if not q_col:
                 continue
             for r in tbl["data_rows"]:
-                # Skip rows that are entirely empty
-                if all(norm(ws.cell(row=r, column=c).value) == "" for c in range(1, ws.max_column + 1)):
+                all_vals = [safe_read(ws, r, c) for c in range(1, ws.max_column + 1)]
+                if not any(norm(v) for v in all_vals):
                     continue
-                q_raw = ws.cell(row=r, column=q_col).value
+                q_raw = safe_read(ws, r, q_col)
                 is_num, q_val = parse_quantity(q_raw)
-                arabic_name = norm(ws.cell(row=r, column=cmap.get("component in arabic", 0)).value)
+                arabic_name = norm(safe_read(ws, r, cmap.get("component in arabic", 0)))
                 cid = component_id_from_row(ws, r, cmap)
                 comp_occ.setdefault(cid, []).append((ws.title, r, q_col, q_val, is_num, arabic_name))
     return comp_occ
 
+# -------------------------
+# allocation & application
+# -------------------------
 def largest_remainder_allocate(originals: List[int], target_total: int) -> List[int]:
-    """Allocate target_total proportionally to originals; ensure integer sum via largest remainder."""
+    """
+    Allocate target_total proportionally to originals; ensure integer sum via largest remainder.
+    """
     if target_total < 0:
         target_total = 0
     n = len(originals)
     if n == 0:
         return []
-
     s = sum(originals)
     if s == 0:
         base = target_total // n
@@ -204,32 +241,16 @@ def largest_remainder_allocate(originals: List[int], target_total: int) -> List[
         for i in range(rem):
             alloc[i] += 1
         return alloc
-
     weights = np.array(originals, dtype=float) / float(s)
     ideal = weights * float(target_total)
     floors = np.floor(ideal).astype(int)
     residual = int(target_total - floors.sum())
     fracs = ideal - floors
-    order = np.argsort(-fracs)  # indices sorted by descending fractional part
+    order = np.argsort(-fracs)
     alloc = floors.copy()
     for i in range(residual):
         alloc[order[i]] += 1
     return alloc.tolist()
-
-def safe_write(ws: Worksheet, row: int, col: int, value: int) -> None:
-    """
-    Write to cell (row, col); if it's a merged child cell, redirect to the master (top-left) cell.
-    """
-    cell = ws.cell(row=row, column=col)
-    # If the cell is a merged child, find its merged range and write to the top-left cell
-    if isinstance(cell, MergedCell):
-        for rng in ws.merged_cells.ranges:
-            if cell.coordinate in rng:
-                master = ws.cell(row=rng.min_row, column=rng.min_col)
-                master.value = int(value)
-                return
-    # Normal cell (or possibly the master of a merged range)
-    cell.value = int(value)
 
 def apply_allocations(wb, comp_occ: Dict[str, List[Occurrence]], comp_targets: Dict[str, int]) -> None:
     """
@@ -242,19 +263,18 @@ def apply_allocations(wb, comp_occ: Dict[str, List[Occurrence]], comp_targets: D
         target_total = comp_targets.get(cid)
         if target_total is None:
             continue
-
-        # Numeric-only occurrences
         numeric_occs = [(ws, r, c, q, is_num, ar) for (ws, r, c, q, is_num, ar) in occs if is_num]
         if not numeric_occs:
             continue
-
         originals = [q for (_, _, _, q, _, _) in numeric_occs]
         new_vals = largest_remainder_allocate(originals, target_total)
-
         for new_q, (ws_name, row_idx, q_col, _, _, _) in zip(new_vals, numeric_occs):
             ws = ws_index[ws_name]
             safe_write(ws, row_idx, q_col, int(new_q))
 
+# -------------------------
+# ratios & targets
+# -------------------------
 def compute_ratios(comp_occ: Dict[str, List[Occurrence]], original_cookers: int) -> Dict[str, float]:
     """Per-component ratio = (sum of numeric quantities) / original cookers."""
     if original_cookers <= 0:
@@ -273,24 +293,18 @@ def compute_targets_from_ratios(ratios: Dict[str, float], desired_cookers: int) 
         targets[cid] = max(int(round(val)), 0)
     return targets
 
-def split_cid(cid: str) -> Tuple[str, str]:
-    parts = cid.split("|", 1)
-    code = parts[0]
-    name = parts[1] if len(parts) > 1 else ""
-    return code, name
-
-def build_preview_dataframe(comp_occ: Dict[str, List[Occurrence]], ratios: Dict[str, float], targets: Dict[str, int]):
+def build_preview_dataframe(comp_occ: Dict[str, List[Occurrence]], ratios: Dict[str, float], targets: Dict[str, int]) -> pd.DataFrame:
     """
     Build the preview DataFrame.
-    Shows Arabic component name (from the first occurrence of each component_id).
+    Shows Arabic component name from the first occurrence within each CODE group.
     """
     rows = []
     for cid, occs in comp_occ.items():
-        code, _ = split_cid(cid)
+        code_display = cid if not cid.startswith("__NO_CODE__@") else ""
         arabic_name = occs[0][5] if occs else ""
         original_total_numeric = sum(q for (_, _, _, q, is_num, _) in occs if is_num)
         rows.append({
-            "Code": code,
+            "Code": code_display,
             "Component (Arabic)": arabic_name,
             "Original total (numeric Qu.)": original_total_numeric,
             "Per-cooker ratio": ratios.get(cid, 0.0),
@@ -300,12 +314,17 @@ def build_preview_dataframe(comp_occ: Dict[str, List[Occurrence]], ratios: Dict[
     df = pd.DataFrame(rows).sort_values(["Code", "Component (Arabic)"]).reset_index(drop=True)
     return df
 
-def is_packaging_component(cid: str) -> bool:
-    _, name = split_cid(cid)
-    return bool(packaging_re.search(name))
+def is_packaging_component(occs_for_one_component: List[Occurrence]) -> bool:
+    """
+    Decide packaging based on Arabic name of the first occurrence in this component group.
+    """
+    if not occs_for_one_component:
+        return False
+    arabic_name = occs_for_one_component[0][5] or ""
+    return bool(packaging_re.search(arabic_name))
 
 # -------------------------
-# Inputs (ensures first paint)
+# Inputs
 # -------------------------
 uploaded = st.file_uploader("Upload Excel file (.xlsx)", type=["xlsx"])
 col_input = st.columns(2)
@@ -317,7 +336,7 @@ with col_input[1]:
 exclude_packaging = st.checkbox("Exclude packaging-only items (foam/cartons) from scaling", value=False)
 
 # -------------------------
-# Main processing (with spinner & try/except)
+# Main processing
 # -------------------------
 if uploaded is not None:
     try:
@@ -332,10 +351,9 @@ if uploaded is not None:
             targets = compute_targets_from_ratios(ratios, desired_cookers)
 
             if exclude_packaging:
-                for cid in list(comp_occ.keys()):
-                    if is_packaging_component(cid):
-                        # Keep original numeric total for packaging items
-                        orig_total_numeric = sum(q for (_, _, _, q, is_num, _) in comp_occ[cid] if is_num)
+                for cid, occs in list(comp_occ.items()):
+                    if is_packaging_component(occs):
+                        orig_total_numeric = sum(q for (_, _, _, q, is_num, _) in occs if is_num)
                         targets[cid] = orig_total_numeric
 
             # Preview
@@ -343,7 +361,7 @@ if uploaded is not None:
             df_prev = build_preview_dataframe(comp_occ, ratios, targets)
             st.dataframe(df_prev, use_container_width=True)
 
-                       # Rewrite quantities while preserving styles
+            # Rewrite quantities while preserving styles
             bio_in.seek(0)
             wb_out = load_workbook(filename=io.BytesIO(bio_in.read()), data_only=False)
             apply_allocations(wb_out, comp_occ, targets)
@@ -358,8 +376,8 @@ if uploaded is not None:
             label="Download recalculated packing list (.xlsx)",
             data=out_buf,
             file_name="packing_list_recalculated.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+            mime="application/vnd.openxmlformats" ,     
+      )
 
     except Exception as e:
         st.error("An error occurred while processing the file.")
@@ -391,4 +409,5 @@ footer_html = """
 """
 st.markdown(footer_css, unsafe_allow_html=True)
 st.markdown(footer_html, unsafe_allow_html=True)
+
 
