@@ -25,6 +25,7 @@ def _ensure_openpyxl():
 _ensure_openpyxl()
 # --- End fallback ---
 
+
 # app.py
 # -*- coding: utf-8 -*-
 """
@@ -32,7 +33,9 @@ Packing List Recalculator (Gas Cookers)
 - Multi-sheet Excel input (each sheet = a container).
 - Detect multiple tables by header row (S.N, Box code, component in arabic, component in E, Codes, Qu., Box).
 - Keep structure & style; only update 'Qu.' using per-cooker ratios.
-- Robust error handling and no stray backticks/duplicated tokens.
+- Handles merged cells safely (writes to master cell only).
+- Only updates rows whose original 'Qu.' is numeric; leaves text/non-numeric as-is.
+- Robust error handling to avoid white screen.
 """
 
 import io
@@ -45,6 +48,7 @@ import pandas as pd
 import streamlit as st
 from openpyxl import load_workbook
 from openpyxl.worksheet.worksheet import Worksheet
+from openpyxl.cell.cell import MergedCell
 
 # -------------------------
 # UI setup (render immediately)
@@ -62,6 +66,7 @@ EXPECTED_HEADERS = {
     "S.N", "Box code", "component in arabic", "component in E", "Codes", "Qu.", "Box"
 }
 
+# Optional: detect packaging items by keywords (used only if you check the box)
 PACKAGING_PATTERNS = [
     r"foam", r"فوم", r"carton", r"كرتون", r"كرتونة", r"زاوية فوم", r"قاعدة فوم", r"شريحة فوم"
 ]
@@ -72,6 +77,34 @@ def norm(x: Any) -> str:
     if x is None:
         return ""
     return str(x).strip()
+
+def parse_quantity(q_raw: Any) -> Tuple[bool, int]:
+    """
+    Try to extract a numeric quantity from a cell value.
+    Returns (is_numeric, int_value).
+
+    - Accepts numbers stored as text or float (e.g., '120', '120.0').
+    - If the text contains a number with words (e.g., '4 بالته'), extracts the first number.
+    - If nothing numeric is found, returns (False, 0).
+    """
+    s = norm(q_raw)
+    if s == "":
+        return (False, 0)
+    # Direct numeric
+    try:
+        val = float(s)
+        return (True, int(round(val)))
+    except Exception:
+        pass
+    # Try to find first number inside text
+    m = re.search(r"[-+]?\d+(?:\.\d+)?", s)
+    if m:
+        try:
+            val = float(m.group(0))
+            return (True, int(round(val)))
+        except Exception:
+            return (False, 0)
+    return (False, 0)
 
 def is_header_row(values: List[Any]) -> bool:
     """Header row if essential subset appears."""
@@ -124,11 +157,16 @@ def component_id_from_row(ws: Worksheet, row: int, col_map: Dict[str, int]) -> s
     comp_name = comp_e if comp_e else comp_ar
     return f"{code}|{comp_name}"
 
-def extract_component_occurrences(wb) -> Dict[str, List[Tuple[str, int, int, int]]]:
+# Occurrence tuple type:
+# (ws_name, row_idx, q_col, numeric_q, is_numeric)
+Occurrence = Tuple[str, int, int, int, bool]
+
+def extract_component_occurrences(wb) -> Dict[str, List[Occurrence]]:
     """
-    Returns: component_id -> list of (worksheet_name, row_idx, q_col, original_q)
+    Returns: component_id -> list of occurrences
+    Each occurrence: (worksheet_name, row_idx, q_col, numeric_q, is_numeric)
     """
-    comp_occ: Dict[str, List[Tuple[str, int, int, int]]] = {}
+    comp_occ: Dict[str, List[Occurrence]] = {}
     for ws in wb.worksheets:
         tables = find_tables(ws)
         for tbl in tables:
@@ -141,14 +179,9 @@ def extract_component_occurrences(wb) -> Dict[str, List[Tuple[str, int, int, int
                 if all(norm(ws.cell(row=r, column=c).value) == "" for c in range(1, ws.max_column + 1)):
                     continue
                 q_raw = ws.cell(row=r, column=q_col).value
-                q_val = 0
-                if norm(q_raw):
-                    try:
-                        q_val = int(float(norm(q_raw)))
-                    except Exception:
-                        q_val = 0
+                is_num, q_val = parse_quantity(q_raw)
                 cid = component_id_from_row(ws, r, cmap)
-                comp_occ.setdefault(cid, []).append((ws.title, r, q_col, q_val))
+                comp_occ.setdefault(cid, []).append((ws.title, r, q_col, q_val, is_num))
     return comp_occ
 
 def largest_remainder_allocate(originals: List[int], target_total: int) -> List[int]:
@@ -179,28 +212,54 @@ def largest_remainder_allocate(originals: List[int], target_total: int) -> List[
         alloc[order[i]] += 1
     return alloc.tolist()
 
-def apply_allocations(wb, comp_occ: Dict[str, List[Tuple[str, int, int, int]]],
-                      comp_targets: Dict[str, int]) -> None:
-    """Overwrite Qu. cells in-place. Styles are preserved by openpyxl."""
+def safe_write(ws: Worksheet, row: int, col: int, value: int) -> None:
+    """
+    Write to cell (row, col); if it's a merged child cell, redirect to the master (top-left) cell.
+    """
+    cell = ws.cell(row=row, column=col)
+    # If the cell is a merged child, find its merged range and write to the top-left cell
+    if isinstance(cell, MergedCell) or cell.coordinate in ws.merged_cells:
+        for rng in ws.merged_cells.ranges:
+            if cell.coordinate in rng:
+                master = ws.cell(row=rng.min_row, column=rng.min_col)
+                master.value = int(value)
+                return
+    # Normal cell
+    cell.value = int(value)
+
+def apply_allocations(wb, comp_occ: Dict[str, List[Occurrence]], comp_targets: Dict[str, int]) -> None:
+    """
+    Overwrite numeric 'Qu.' cells in-place only. Styles preserved by openpyxl.
+    - Non-numeric original 'Qu.' cells are left unchanged.
+    - If a target total must be distributed but a component has zero numeric occurrences, nothing is written.
+    """
     ws_index = {ws.title: ws for ws in wb.worksheets}
     for cid, occs in comp_occ.items():
         target_total = comp_targets.get(cid)
         if target_total is None:
             continue
-        originals = [q for (_, _, _, q) in occs]
-        new_vals = largest_remainder_allocate(originals, target_total)
-        for new_q, (ws_name, row_idx, q_col, _) in zip(new_vals, occs):
-            ws = ws_index[ws_name]
-            ws.cell(row=row_idx, column=q_col).value = int(new_q)
 
-def compute_ratios(comp_occ: Dict[str, List[Tuple[str, int, int, int]]], original_cookers: int) -> Dict[str, float]:
-    """Per-component ratio = total quantity / original cookers."""
+        # Split occurrences into numeric vs non-numeric
+        numeric_occs = [(ws, r, c, q, is_num) for (ws, r, c, q, is_num) in occs if is_num]
+        if not numeric_occs:
+            # Nothing to write for this component
+            continue
+
+        originals = [q for (_, _, _, q, _) in numeric_occs]
+        new_vals = largest_remainder_allocate(originals, target_total)
+
+        for new_q, (ws_name, row_idx, q_col, _, _) in zip(new_vals, numeric_occs):
+            ws = ws_index[ws_name]
+            safe_write(ws, row_idx, q_col, int(new_q))
+
+def compute_ratios(comp_occ: Dict[str, List[Occurrence]], original_cookers: int) -> Dict[str, float]:
+    """Per-component ratio = (sum of numeric quantities) / original cookers."""
     if original_cookers <= 0:
         return {k: 0.0 for k in comp_occ}
     ratios = {}
     for cid, occs in comp_occ.items():
-        total_q = sum(q for (_, _, _, q) in occs)
-        ratios[cid] = total_q / float(original_cookers)
+        total_q_numeric = sum(q for (_, _, _, q, is_num) in occs if is_num)
+        ratios[cid] = total_q_numeric / float(original_cookers)
     return ratios
 
 def compute_targets_from_ratios(ratios: Dict[str, float], desired_cookers: int) -> Dict[str, int]:
@@ -217,18 +276,18 @@ def split_cid(cid: str) -> Tuple[str, str]:
     name = parts[1] if len(parts) > 1 else ""
     return code, name
 
-def build_preview_dataframe(comp_occ, ratios, targets):
+def build_preview_dataframe(comp_occ: Dict[str, List[Occurrence]], ratios: Dict[str, float], targets: Dict[str, int]):
     rows = []
     for cid, occs in comp_occ.items():
         code, name = split_cid(cid)
-        original_total = sum(q for (_, _, _, q) in occs)
+        original_total_numeric = sum(q for (_, _, _, q, is_num) in occs if is_num)
         rows.append({
             "Code": code,
             "Component": name,
-            "Original total (Qu.)": original_total,
+            "Original total (numeric Qu.)": original_total_numeric,
             "Per-cooker ratio": ratios.get(cid, 0.0),
-            "Target total (Qu.)": targets.get(cid, original_total),
-            "Occurrences": len(occs)
+            "Target total (Qu.)": targets.get(cid, original_total_numeric),
+            "Occurrences (numeric/all)": f"{sum(1 for o in occs if o[4])}/{len(occs)}"
         })
     df = pd.DataFrame(rows).sort_values(["Code", "Component"]).reset_index(drop=True)
     return df
@@ -267,8 +326,9 @@ if uploaded is not None:
             if exclude_packaging:
                 for cid in list(comp_occ.keys()):
                     if is_packaging_component(cid):
-                        orig_total = sum(q for (_, _, _, q) in comp_occ[cid])
-                        targets[cid] = orig_total
+                        # Keep original numeric total for packaging items
+                        orig_total_numeric = sum(q for (_, _, _, q, is_num) in comp_occ[cid] if is_num)
+                        targets[cid] = orig_total_numeric
 
             # Preview
             st.subheader("Preview of totals and ratios")
@@ -285,7 +345,7 @@ if uploaded is not None:
             wb_out.save(out_buf)
             out_buf.seek(0)
 
-        st.success("New workbook is ready. Only 'Qu.' values were changed; styles and layout remain unchanged.")
+        st.success("New workbook is ready. Only numeric 'Qu.' values were changed; styles and layout remain unchanged.")
         st.download_button(
             label="Download recalculated packing list (.xlsx)",
             data=out_buf,
@@ -299,6 +359,26 @@ if uploaded is not None:
         tb = traceback.format_exc()
         st.text("Traceback:")
         st.code(tb)
-else:
-    st.info("Upload an Excel")
 
+# ==== Centered footer ====
+footer_css = """
+<style>
+.app-footer {
+  position: fixed;
+  left: 50%;
+  bottom: 12px;
+  transform: translateX(-50%);
+  z-index: 9999;
+  background: rgba(255,255,255,0.85);
+  border: 1px solid #e6e6e6;
+  border-radius: 14px;
+  padding: 8px 14px;
+  font-weight: 600;
+  font-size: 14px;
+}
+</style>
+"""
+footer_html = """
+<div class="app-footer">✨ تم التنفيذ بواسطة م / بيتر عمانوئيل – جميع الحقوق محفوظة © 2025 ✨</div>
+"""
+st.markdown(footer_css, unsafe_allow_html=True)
