@@ -31,21 +31,23 @@ _ensure_openpyxl()
 # app.py
 # -*- coding: utf-8 -*-
 """
-Packing List Recalculator (Gas Cookers)
-- Multi-sheet Excel input (each sheet = a container).
-- Detect multiple tables by header row:
-  S.N | Box code | component in arabic | component in E | Codes | Qu. | Box
-- Preserve structure & styles; only update 'Qu.' using per-cooker ratios.
-- Safe READ and WRITE for merged cells (read/write the master—top-left—cell).
-- Only updates rows whose original 'Qu.' is numeric; text/unit rows remain as-is.
-- Preview shows the ARABIC component name.
-- GROUPING BY CODE ONLY. If Codes is empty, treat the row as unique (no cross-row merging).
-- Robust error handling (no blank page; errors are shown in the UI).
+Packing List Recalculator (Gas Cookers) – Order-driven ratios
+
+Workflow (tabs):
+1) Order (master): paste a 3-column table -> Material code, Name description, Full quantity of the order
+2) Packing Lists: upload the workbook (.xlsx) with any number of sheets/tables
+3) Options & Run: enter Order cooker quantity, Target cooker quantity (for these packing lists), run
+4) Preview & Download: inspect results and export the recalculated workbook
+
+Key design:
+- GROUP BY CODE ONLY (SAP material code). Names never used for grouping.
+- Safe READ/WRITE for merged cells (always use master top-left cell).
+- Only update numeric Qu. cells; text/unit rows remain intact.
+- Keep structure & styles: same sheets, same boxes/rows; only Qu. values change.
 """
 
 import io
 import re
-import traceback
 from typing import Dict, List, Tuple, Any, Optional
 
 import numpy as np
@@ -55,28 +57,19 @@ from openpyxl import load_workbook
 from openpyxl.worksheet.worksheet import Worksheet
 
 # -------------------------
-# UI setup
+# Page setup
 # -------------------------
-st.set_page_config(page_title="Packing List Recalculator", layout="wide")
-st.title("Packing List Recalculator (Gas Cookers)")
-st.write("Upload your Excel packing list (one or more worksheets).")
-st.write("Enter the original cookers count represented by the file and the desired cookers count.")
-st.write("The app will adjust the 'Qu.' column proportionally and preserve the original structure and styles.")
+st.set_page_config(page_title="Packing List Recalculator (Order-driven)", layout="wide")
+st.title("Packing List Recalculator (Order-driven ratios)")
 
 # -------------------------
-# Constants & helpers
+# Helpers & constants
 # -------------------------
 EXPECTED_HEADERS = {
     "S.N", "Box code", "component in arabic", "component in E", "Codes", "Qu.", "Box"
 }
 
-PACKAGING_PATTERNS = [
-    r"foam", r"فوم", r"carton", r"كرتون", r"كرتونة", r"زاوية فوم", r"قاعدة فوم", r"شريحة فوم"
-]
-packaging_re = re.compile("|".join(PACKAGING_PATTERNS), flags=re.IGNORECASE)
-
 def norm(x: Any) -> str:
-    """Normalize a cell value to trimmed string."""
     if x is None:
         return ""
     return str(x).strip()
@@ -107,19 +100,14 @@ def parse_quantity(q_raw: Any) -> Tuple[bool, int]:
     return (False, 0)
 
 def is_header_row(values: List[Any]) -> bool:
-    """Treat a row as header if essential subset appears."""
     vals = {norm(v) for v in values if norm(v)}
     essential = {"S.N", "Codes", "Qu."}
     return essential.issubset(vals)
 
 # -------------------------
-# merged-cell helpers
+# merged cell safe read & write
 # -------------------------
 def find_merged_master(ws: Worksheet, row: int, col: int) -> Optional[Tuple[int, int]]:
-    """
-    If (row, col) is inside a merged range, return (min_row, min_col) of that range.
-    Otherwise return None.
-    """
     coord = ws.cell(row=row, column=col).coordinate
     for rng in ws.merged_cells.ranges:
         if coord in rng:
@@ -127,18 +115,12 @@ def find_merged_master(ws: Worksheet, row: int, col: int) -> Optional[Tuple[int,
     return None
 
 def safe_read(ws: Worksheet, row: int, col: int) -> Any:
-    """
-    Read value from cell (row, col); if it's part of a merged range, return the master (top-left) value.
-    """
     master = find_merged_master(ws, row, col)
     if master is not None:
         return ws.cell(row=master[0], column=master[1]).value
     return ws.cell(row=row, column=col).value
 
 def safe_write(ws: Worksheet, row: int, col: int, value: int) -> None:
-    """
-    Write to cell (row, col); if it's a merged child cell, redirect to the master (top-left) cell.
-    """
     master = find_merged_master(ws, row, col)
     target_row, target_col = (master if master is not None else (row, col))
     ws.cell(row=target_row, column=target_col).value = int(value)
@@ -148,13 +130,11 @@ def safe_write(ws: Worksheet, row: int, col: int, value: int) -> None:
 # -------------------------
 def find_tables(ws: Worksheet) -> List[Dict[str, Any]]:
     """
-    Scan a worksheet to find tables by header rows.
-    Return list of dicts: {header_row, col_map, data_rows}
+    Find tables by header rows. Return: [{header_row, col_map, data_rows}]
     """
     tables = []
     max_row = ws.max_row
     max_col = ws.max_column
-
     row_idx = 1
     while row_idx <= max_row:
         row_vals = [safe_read(ws, row_idx, c) for c in range(1, max_col + 1)]
@@ -176,32 +156,23 @@ def find_tables(ws: Worksheet) -> List[Dict[str, Any]]:
             row_idx = r
         else:
             row_idx += 1
-
     return tables
 
 # -------------------------
-# component & occurrences
+# occurrences (group by CODE ONLY)
 # -------------------------
+# Occurrence tuple:
+# (ws_name, row_idx, q_col, numeric_q, is_numeric, arabic_name, code)
+Occurrence = Tuple[str, int, int, int, bool, str, str]
+
 def component_id_from_row(ws: Worksheet, row: int, col_map: Dict[str, int]) -> str:
-    """
-    Build component identifier: GROUP BY CODE ONLY.
-    - If Codes is present: use it as the unique key.
-    - If Codes is empty: create a per-row unique key so we don't merge unrelated "بدون" lines.
-    """
     code = norm(safe_read(ws, row, col_map.get("Codes", 0)))
     if code:
         return code
+    # No code => keep row isolated; don't merge with other no‑code rows
     return f"__NO_CODE__@{ws.title}@{row}"
 
-# Occurrence tuple includes ARABIC NAME:
-# (ws_name, row_idx, q_col, numeric_q, is_numeric, arabic_name)
-Occurrence = Tuple[str, int, int, int, bool, str]
-
 def extract_component_occurrences(wb) -> Dict[str, List[Occurrence]]:
-    """
-    Returns: component_id -> list of occurrences
-    Each occurrence: (worksheet_name, row_idx, q_col, numeric_q, is_numeric, arabic_name)
-    """
     comp_occ: Dict[str, List[Occurrence]] = {}
     for ws in wb.worksheets:
         tables = find_tables(ws)
@@ -218,16 +189,14 @@ def extract_component_occurrences(wb) -> Dict[str, List[Occurrence]]:
                 is_num, q_val = parse_quantity(q_raw)
                 arabic_name = norm(safe_read(ws, r, cmap.get("component in arabic", 0)))
                 cid = component_id_from_row(ws, r, cmap)
-                comp_occ.setdefault(cid, []).append((ws.title, r, q_col, q_val, is_num, arabic_name))
+                code_display = cid if not cid.startswith("__NO_CODE__@") else ""
+                comp_occ.setdefault(cid, []).append((ws.title, r, q_col, q_val, is_num, arabic_name, code_display))
     return comp_occ
 
 # -------------------------
-# allocation & application
+# allocation
 # -------------------------
 def largest_remainder_allocate(originals: List[int], target_total: int) -> List[int]:
-    """
-    Allocate target_total proportionally to originals; ensure integer sum via largest remainder.
-    """
     if target_total < 0:
         target_total = 0
     n = len(originals)
@@ -253,138 +222,208 @@ def largest_remainder_allocate(originals: List[int], target_total: int) -> List[
     return alloc.tolist()
 
 def apply_allocations(wb, comp_occ: Dict[str, List[Occurrence]], comp_targets: Dict[str, int]) -> None:
-    """
-    Overwrite numeric 'Qu.' cells in-place only. Styles preserved by openpyxl.
-    - Non-numeric original 'Qu.' cells are left unchanged.
-    - If a target total must be distributed but a component has zero numeric occurrences, nothing is written.
-    """
     ws_index = {ws.title: ws for ws in wb.worksheets}
     for cid, occs in comp_occ.items():
         target_total = comp_targets.get(cid)
         if target_total is None:
             continue
-        numeric_occs = [(ws, r, c, q, is_num, ar) for (ws, r, c, q, is_num, ar) in occs if is_num]
+        numeric_occs = [(ws, r, c, q, is_num, ar, code) for (ws, r, c, q, is_num, ar, code) in occs if is_num]
         if not numeric_occs:
             continue
-        originals = [q for (_, _, _, q, _, _) in numeric_occs]
+        originals = [q for (_, _, _, q, _, _, _) in numeric_occs]
         new_vals = largest_remainder_allocate(originals, target_total)
-        for new_q, (ws_name, row_idx, q_col, _, _, _) in zip(new_vals, numeric_occs):
+        for new_q, (ws_name, row_idx, q_col, _, _, _, _) in zip(new_vals, numeric_occs):
             ws = ws_index[ws_name]
             safe_write(ws, row_idx, q_col, int(new_q))
 
 # -------------------------
-# ratios & targets
+# ratios & targets (ORDER-driven)
 # -------------------------
-def compute_ratios(comp_occ: Dict[str, List[Occurrence]], original_cookers: int) -> Dict[str, float]:
-    """Per-component ratio = (sum of numeric quantities) / original cookers."""
-    if original_cookers <= 0:
-        return {k: 0.0 for k in comp_occ}
-    ratios = {}
-    for cid, occs in comp_occ.items():
-        total_q_numeric = sum(q for (_, _, _, q, is_num, _) in occs if is_num)
-        ratios[cid] = total_q_numeric / float(original_cookers)
+def compute_order_ratios(order_df: pd.DataFrame, order_cookers: int) -> Dict[str, float]:
+    """
+    order_df columns (required):
+      - Material code (string)
+      - Name description (string) [not used for grouping]
+      - Full quantity of the order (numeric)
+    Returns: dict[code] -> per-cooker ratio
+    """
+    ratios: Dict[str, float] = {}
+    if order_cookers <= 0 or order_df.empty:
+        return ratios
+    # Clean columns
+    df = order_df.copy()
+    df.columns = [c.strip().lower() for c in df.columns]
+    # Expected normalized names
+    # 'material code', 'name description', 'full quantity of the order'
+    # Be robust to slight naming differences:
+    col_code = next((c for c in df.columns if "material" in c and "code" in c), "material code")
+    col_qty = next((c for c in df.columns if "quantity" in c and "order" in c), "full quantity of the order")
+    if col_code not in df.columns or col_qty not in df.columns:
+        return ratios
+    # Drop blanks and non-numeric quantities
+    df = df[[col_code, col_qty]].copy()
+    df[col_code] = df[col_code].astype(str).str.strip()
+    def _to_int(x):
+        try:
+            return int(round(float(str(x).strip())))
+        except Exception:
+            return 0
+    df[col_qty] = df[col_qty].map(_to_int)
+    df = df[df[col_code] != ""]
+    df_grp = df.groupby(col_code, as_index=True)[col_qty].sum()
+    for code, total in df_grp.items():
+        ratios[code] = total / float(order_cookers)
     return ratios
 
-def compute_targets_from_ratios(ratios: Dict[str, float], desired_cookers: int) -> Dict[str, int]:
-    """Target totals = ratio * desired cookers, rounded to nearest int (>=0)."""
-    targets = {}
-    for cid, r in ratios.items():
-        val = r * float(desired_cookers)
-        targets[cid] = max(int(round(val)), 0)
+def build_targets_from_order_ratios(order_ratios: Dict[str, float], target_cookers: int,
+                                    workbook_codes: List[str]) -> Dict[str, int]:
+    """
+    For each code that appears in the workbook, if it exists in the order ratios,
+    build target_total = round(ratio * target_cookers). If missing, leave None (unchanged).
+    """
+    targets: Dict[str, int] = {}
+    for cid in workbook_codes:
+        if cid.startswith("__NO_CODE__@"):
+            # No-code rows left unchanged
+            continue
+        r = order_ratios.get(cid)
+        if r is None:
+            # Missing code in order => keep as-is (target not set)
+            continue
+        targets[cid] = max(int(round(r * float(target_cookers))), 0)
     return targets
 
-def build_preview_dataframe(comp_occ: Dict[str, List[Occurrence]], ratios: Dict[str, float], targets: Dict[str, int]) -> pd.DataFrame:
-    """
-    Build the preview DataFrame.
-    Shows Arabic component name from the first occurrence within each CODE group.
-    """
-    rows = []
-    for cid, occs in comp_occ.items():
-        code_display = cid if not cid.startswith("__NO_CODE__@") else ""
-        arabic_name = occs[0][5] if occs else ""
-        original_total_numeric = sum(q for (_, _, _, q, is_num, _) in occs if is_num)
-        rows.append({
-            "Code": code_display,
-            "Component (Arabic)": arabic_name,
-            "Original total (numeric Qu.)": original_total_numeric,
-            "Per-cooker ratio": ratios.get(cid, 0.0),
-            "Target total (Qu.)": targets.get(cid, original_total_numeric),
-            "Occurrences (numeric/all)": f"{sum(1 for o in occs if o[4])}/{len(occs)}"
-        })
-    df = pd.DataFrame(rows).sort_values(["Code", "Component (Arabic)"]).reset_index(drop=True)
-    return df
-
-def is_packaging_component(occs_for_one_component: List[Occurrence]) -> bool:
-    """
-    Decide packaging based on Arabic name of the first occurrence in this component group.
-    """
-    if not occs_for_one_component:
-        return False
-    arabic_name = occs_for_one_component[0][5] or ""
-    return bool(packaging_re.search(arabic_name))
-
 # -------------------------
-# Inputs
+# UI tabs
 # -------------------------
-uploaded = st.file_uploader("Upload Excel file (.xlsx)", type=["xlsx"])
-col_input = st.columns(2)
-with col_input[0]:
-    original_cookers = st.number_input("Original shipment cookers count", min_value=1, value=250, step=1)
-with col_input[1]:
-    desired_cookers = st.number_input("Desired cookers count", min_value=1, value=250, step=1)
+tab_order, tab_packing, tab_run, tab_preview = st.tabs(
+    ["1) Order (master)", "2) Packing Lists", "3) Options & Run", "4) Preview & Download"]
+)
 
-exclude_packaging = st.checkbox("Exclude packaging-only items (foam/cartons) from scaling", value=False)
+with tab_order:
+    st.subheader("Paste the full order (master shipment)")
+    st.write("Required columns (in this order): **Material code**, **Name description**, **Full quantity of the order**")
+    example = pd.DataFrame({
+        "Material code": ["100001234", "400045501"],
+        "Name description": ["Fan motor", "Carton Plaza 60"],
+        "Full quantity of the order": [2500, 600]
+    })
+    st.caption("Tip: Click into the table below and paste your rows (Ctrl+V). You can also load from CSV/Excel and paste here.")
+    order_df = st.data_editor(
+        example,
+        use_container_width=True,
+        num_rows="dynamic",
+        key="order_data_editor",
+    )
 
-# -------------------------
-# Main processing
-# -------------------------
-if uploaded is not None:
-    try:
-        with st.spinner("Reading workbook and computing allocations..."):
-            data = uploaded.read()
-            bio_in = io.BytesIO(data)
+with tab_packing:
+    st.subheader("Upload the packing lists workbook (.xlsx)")
+    st.write("The app will handle multiple sheets and multiple table sections per sheet.")
+    uploaded = st.file_uploader("Upload Excel file", type=["xlsx"], key="packing_uploader")
+    if uploaded is not None:
+        data = uploaded.read()
+        bio_in_tmp = io.BytesIO(data)
+        wb_tmp = load_workbook(filename=bio_in_tmp, data_only=True)
+        st.write(f"Detected {len(wb_tmp.worksheets)} worksheet(s).")
+        for ws in wb_tmp.worksheets:
+            st.write(f"• **{ws.title}**")
+            # lightweight table count preview
+            tables = find_tables(ws)
+            st.write(f"   Tables detected: {len(tables)}")
 
-            # Read values for analysis
-            wb_in = load_workbook(filename=bio_in, data_only=True)
-            comp_occ = extract_component_occurrences(wb_in)
-            ratios = compute_ratios(comp_occ, original_cookers)
-            targets = compute_targets_from_ratios(ratios, desired_cookers)
+with tab_run:
+    st.subheader("Options & Run")
+    colA, colB = st.columns(2)
+    with colA:
+        order_cookers = st.number_input("Order cooker quantity (for ratio calculation)", min_value=1, value=250, step=1)
+    with colB:
+        target_cookers = st.number_input("Target cooker quantity (for these packing lists)", min_value=1, value=250, step=1)
 
-            if exclude_packaging:
-                for cid, occs in list(comp_occ.items()):
-                    if is_packaging_component(occs):
-                        orig_total_numeric = sum(q for (_, _, _, q, is_num, _) in occs if is_num)
-                        targets[cid] = orig_total_numeric
+    st.caption("Ratios are computed from the order table, not from packing lists. We'll scale packing list quantities to match target cookers.")
+    exclude_packaging = st.checkbox("Keep rows without code (and any text/unit quantities) unchanged", value=True,
+                                    help="Rows missing a material code or with non-numeric Qu. will not be modified.")
 
-            # Preview
-            st.subheader("Preview of totals and ratios")
-            df_prev = build_preview_dataframe(comp_occ, ratios, targets)
-            st.dataframe(df_prev, use_container_width=True)
+    run_btn = st.button("Compute & Prepare Output", type="primary")
 
-            # Rewrite quantities while preserving styles
-            bio_in.seek(0)
-            wb_out = load_workbook(filename=io.BytesIO(bio_in.read()), data_only=False)
-            apply_allocations(wb_out, comp_occ, targets)
+    if run_btn:
+        # Validate order df
+        df_order = order_df.copy()
+        df_order.columns = [c.strip() for c in df_order.columns]
+        needed_cols = {"Material code", "Name description", "Full quantity of the order"}
+        if not needed_cols.issubset(set(df_order.columns)):
+            st.error("Order table must have columns: Material code, Name description, Full quantity of the order")
+        elif uploaded is None:
+            st.error("Please upload the packing lists workbook in tab 2.")
+        else:
+            # Compute order ratios
+            order_ratios = compute_order_ratios(df_order, order_cookers)
+            if not order_ratios:
+                st.error("No valid order ratios could be computed. Check 'Material code' and 'Full quantity of the order' columns and 'Order cooker quantity'.")
+            else:
+                # Load workbook (twice: once for analysis, once for writing with styles)
+                raw = uploaded.getvalue()
+                bio_in = io.BytesIO(raw)
+                wb_in = load_workbook(filename=bio_in, data_only=True)
+                comp_occ = extract_component_occurrences(wb_in)
 
-            # Save to buffer for download
-            out_buf = io.BytesIO()
-            wb_out.save(out_buf)
-            out_buf.seek(0)
+                # Gather workbook codes
+                workbook_codes = list(comp_occ.keys())
 
-        st.success("New workbook is ready. Only numeric 'Qu.' values were changed; styles and layout remain unchanged.")
-        st.download_button(
-            label="Download recalculated packing list (.xlsx)",
-            data=out_buf,
-            file_name="packing_list_recalculated.xlsx",
-            mime="application/vnd.openxmlformats" ,     
-      )
+                # Build targets for workbook codes using order ratios
+                targets = build_targets_from_order_ratios(order_ratios, target_cookers, workbook_codes)
 
-    except Exception as e:
-        st.error("An error occurred while processing the file.")
-        st.exception(e)
-        tb = traceback.format_exc()
-        st.text("Traceback:")
-        st.code(tb)
+                # Prepare a session buffer for output
+                bio_in.seek(0)
+                wb_out = load_workbook(filename=io.BytesIO(bio_in.read()), data_only=False)
+
+                # Apply allocations (numeric-only; no-code rows left unchanged)
+                apply_allocations(wb_out, comp_occ, targets)
+
+                # Save in session state for preview/download
+                out_buf = io.BytesIO()
+                wb_out.save(out_buf)
+                out_buf.seek(0)
+                st.session_state["out_buf"] = out_buf
+                st.session_state["comp_occ"] = comp_occ
+                st.session_state["targets"] = targets
+                st.session_state["order_ratios"] = order_ratios
+                st.success("Output prepared. Go to '4) Preview & Download' to inspect and export.")
+
+with tab_preview:
+    st.subheader("Preview & Download")
+    if "comp_occ" in st.session_state and "targets" in st.session_state:
+        comp_occ = st.session_state["comp_occ"]
+        targets = st.session_state["targets"]
+        order_ratios = st.session_state.get("order_ratios", {})
+
+        # Build preview DF (Arabic names + code)
+        rows = []
+        for cid, occs in comp_occ.items():
+            code_display = cid if not cid.startswith("__NO_CODE__@") else ""
+            arabic_name = occs[0][5] if occs else ""
+            original_total_numeric = sum(q for (_, _, _, q, is_num, _, _) in occs if is_num)
+            ratio = order_ratios.get(cid, None)
+            tgt = targets.get(cid, None)
+            rows.append({
+                "Code": code_display,
+                "Component (Arabic)": arabic_name,
+                "Original total (numeric Qu.)": original_total_numeric,
+                "Per-cooker ratio (from order)": (ratio if ratio is not None else ""),
+                "Target total (Qu.)": (tgt if tgt is not None else ""),
+                "Occurrences (numeric/all)": f"{sum(1 for o in occs if o[4])}/{len(occs)}"
+            })
+        df_prev = pd.DataFrame(rows).sort_values(["Code", "Component (Arabic)"]).reset_index(drop=True)
+        st.dataframe(df_prev, use_container_width=True)
+
+        if "out_buf" in st.session_state:
+            st.download_button(
+                label="Download recalculated packing list (.xlsx)",
+                data=st.session_state["out_buf"],
+                file_name="packing_list_recalculated.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                       )
+
+
 
 # ==== Centered footer ====
 footer_css = """
@@ -409,5 +448,6 @@ footer_html = """
 """
 st.markdown(footer_css, unsafe_allow_html=True)
 st.markdown(footer_html, unsafe_allow_html=True)
+
 
 
